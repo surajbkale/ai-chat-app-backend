@@ -1,3 +1,4 @@
+import { text } from "express";
 import OpenAI from "openai";
 import type { AssistantStream } from "openai/lib/AssistantStream";
 import type { Channel, Event, MessageResponse, StreamChat } from "stream-chat";
@@ -16,16 +17,76 @@ export class OpenAIResponseHandler {
     private readonly chatClient: StreamChat,
     private readonly channel: Channel,
     private readonly message: MessageResponse,
-    private readonly onDisposeL: () => void
+    private readonly onDispose: () => void
   ) {
     this.chatClient.on("ai_indicator.stop", this.handleStopGenerating);
   }
 
   run = async () => {};
-  dispose = async () => {};
-  private handleStopGenerating = async (event: Event) => {};
+
+  dispose = async () => {
+    if (this.is_done) {
+      return;
+    }
+
+    this.is_done = true;
+    this.chatClient.off("ai_indicator.stop", this.handleStopGenerating);
+    this.onDispose();
+  };
+
+  private handleStopGenerating = async (event: Event) => {
+    if (this.is_done || event.message_id !== this.message.id) {
+      return;
+    }
+
+    console.log("Stop generating for message", this.message.id);
+
+    if (!this.openai || !this.openAiThread || !this.run_id) {
+      return;
+    }
+
+    try {
+      await this.openai.beta.threads.runs.cancel(
+        //Later check fix code
+        this.run_id,
+        {
+          thread_id: this.openAiThread.id,
+        }
+      );
+    } catch (e) {
+      console.error("Error cancelling run", e);
+    }
+    await this.channel.sendEvent({
+      type: "ai_indicator.clear",
+      cid: this.message.cid,
+      message_id: this.message.id,
+    });
+    await this.dispose();
+  };
+
   private handleStreamEvent = async (event: Event) => {};
-  private handleError = async (event: Event) => {};
+
+  private handleError = async (error: Error) => {
+    if (this.is_done) {
+      return;
+    }
+
+    await this.channel.sendEvent({
+      type: "ai_indicator.update",
+      ai_state: "AI_STATE_ERROR",
+      cid: this.message.cid,
+      message_id: this.message.id,
+    });
+
+    await this.chatClient.partialUpdateMessage(this.message.id, {
+      set: {
+        text: error.message ?? "Error generating the message",
+        message: error.toString(),
+      },
+    });
+
+    await this.dispose();
+  };
 
   private performWebSearch = async (query: string): Promise<string> => {
     const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
